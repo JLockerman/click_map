@@ -165,8 +165,15 @@ impl<K> KeyPtr<K> {
         self.ptr.cas_box(KeyPtr::empty(), key, 0)
     }
 
-    fn try_fill_ptr<'p>(&self, key: Ptr<'p, (u64, K)>) -> Result<(), Ptr<'p, (u64, K)>> {
-        self.ptr.cas(KeyPtr::empty(), key)
+    fn try_fill_owned<'p>(&self, key: OwnedKey<'p, K>)
+    -> Result<(), (Ptr<'p, (u64, K)>, OwnedKey<'p, K>)> {
+        match key {
+            OwnedKey::Boxed(key) => self.ptr.cas_box(KeyPtr::empty(), key, 0)
+                .map(|_| ())
+                .map_err(|(p, k)| (p, OwnedKey::Boxed(k))),
+            OwnedKey::Ptr(key) => self.ptr.cas(KeyPtr::empty(), key.0)
+                .map_err(|p| (p, OwnedKey::Ptr(key))),
+        }
     }
 
     fn get<'p>(&self, pin: &'p Pin) -> Option<&'p K> {
@@ -175,6 +182,58 @@ impl<K> KeyPtr<K> {
 
     fn load<'p>(&self, pin: &'p Pin) -> Ptr<'p, (u64, K)> {
         self.ptr.load(pin)
+    }
+
+    fn start_move<'p>(&self, pin: &'p Pin)
+    -> Option<OwnedKey<'p, K>> {
+        let original = self.load(pin);
+        if original.is_null() { return None }
+        match original.tag() {
+            TOMBSTONE | MOVED => return Some(OwnedKey::Boxed(Box::new(unsafe { ptr::read(original.as_raw()) }))),
+            _ => (),
+        }
+        match self.ptr.cas(original, original.with_tag(MOVED)) {
+            Ok(()) => Some(OwnedKey::Ptr(Owned(original))),
+            Err(..) => Some(OwnedKey::Boxed(Box::new(unsafe { ptr::read(original.as_raw()) }))),
+        }
+    }
+
+    fn try_free<'p>(&self, pin: &'p Pin) {
+        let original = self.load(pin);
+        if original.is_null() { return }
+        match original.tag() {
+            TOMBSTONE | MOVED => return,
+            _ => (),
+        }
+        match self.ptr.cas(original, original.with_tag(TOMBSTONE)) {
+            Err(..) => return,
+            Ok(()) => unsafe{ epoch::defer_free(original.as_raw(), 1, pin) },
+        }
+    }
+}
+
+enum OwnedKey<'p, K: 'p> {
+    Boxed(Box<(u64, K)>),
+    Ptr(Owned<'p, (u64, K)>),
+}
+
+impl<'p, K: 'p> OwnedKey<'p, K> {
+    fn free(self, pin: &'p Pin) {
+        match self {
+            //FIXME we never drop keys atm
+            OwnedKey::Boxed(b) => unsafe {epoch::defer_free(Box::into_raw(b), 1, pin)},
+            OwnedKey::Ptr(p) => unsafe {epoch::defer_free(p.0.as_raw(), 1, pin)},
+        }
+    }
+}
+
+impl<'p, K: 'p> ::std::ops::Deref for OwnedKey<'p, K> {
+    type Target = (u64, K);
+    fn deref(&self) -> &Self::Target {
+        match self {
+            &OwnedKey::Boxed(ref b) => &**b,
+            &OwnedKey::Ptr(ref p) => p.0.unwrap(),
+        }
     }
 }
 
@@ -238,12 +297,6 @@ impl<V> ValPtr<V> {
         }
     }
 
-    fn needs_move(&self, pin: &Pin) -> bool {
-        let ptr = self.ptr.load(pin);
-        let tag = ptr.tag();
-        !(ptr.is_null()) && tag != TOMBSTONE && tag != MOVED
-    }
-
     fn remove(&self, pin: &Pin) -> Result<(), ValPtrGetErr> {
         use ValPtrGetErr::*;
         let old = self.ptr.swap(Ptr::null(TOMBSTONE));
@@ -292,6 +345,10 @@ struct OldVal<'p, V:'p>(Ptr<'p, V>);
 impl<'p, V:'p> OldVal<'p, V> {
     fn needs_move(&self) -> bool {
         self.0.tag() == 0 && !self.0.is_null()
+    }
+
+    fn is_tombstone(&self) -> bool {
+        self.0.tag() == TOMBSTONE && !self.0.is_null()
     }
 
     fn moving(&self) -> Self {
@@ -374,59 +431,36 @@ where H: Clone {
         }
     }
 
+    //TODO only move until we reach a Moved, after that some other thread will move them
+    //     but how do we know when the map is finished?
     fn move_contents_to(&self, new: &Self, start_loc: isize, pin: &Pin)
     where K: PartialEq {
-        //FIXME handle moves from new inserts differently
         let old_table = self.table.load(pin).as_raw();
         let new_table = new.table.load(pin).as_raw();
+        let new_shift = new.shift;
         unsafe {
-            'table: for old_off in (start_loc..(1 << self.shift)).chain(0..start_loc) {
+            for old_off in (start_loc..(1 << self.shift)).chain(0..start_loc) {
                 let old_cell = old_table.offset(old_off);
-                if !(*old_cell).val.needs_move(pin) { continue }
-                let key = (*old_cell).key.load(pin);
-                if key.is_null() { continue }
-                //FIXME handle running out of space (concurrent writes)
-                'cell: for new_off in search_path(key.unwrap().0, new.shift) {
-                    let new_cell = new_table.offset(new_off);
-                    //FIXME handle key dealloc
-                    match (*new_cell).key.try_fill_ptr(key) {
-                        Err(found) => {
-                            if found.as_ref() == key.as_ref() {
-                                break 'cell
-                            }
-                        }
-                        Ok(..) => {
-                            let mut expected_new_val = ValPtr::empty();
-                            'swap: loop {
-                                let old_val = (*old_cell).val.load_old(pin);
-                                if !old_val.needs_move() {
-                                    break 'cell
-                                }
-                                let got = (*new_cell).val.start_move(&expected_new_val, &old_val);
-                                match got {
-                                    Ok(Some(owned)) => owned.free(pin),
-                                    Ok(None) => {},
-                                    Err(new_val) => {
-                                        expected_new_val = new_val;
-                                        continue 'swap
-                                    },
-                                }
-                                if (*old_cell).val.mark_as_moved(&old_val).is_err() {
-                                    continue 'swap
-                                };
-                                atomic::fence(Ordering::SeqCst); //TODO which ordering, and is this needed?
-                                if (*new_cell).val.finish_move(old_val).is_ok() {
-                                    break 'cell
-                                }
-                            }
-                        },
+                let old_val = (*old_cell).val.load_old(pin);
+                if !old_val.needs_move() {
+                    if old_val.is_tombstone() {
+                        (*old_cell).key.try_free(pin);
                     }
+                    continue
                 }
+                let key = (*old_cell).key.start_move(pin);
+                let key = match key {
+                    None => continue,
+                    Some(key) => key,
+                };
+                //FIXME handle running out of space (concurrent writes)
+                let moved = move_cell(old_cell, new_table, new_shift, key, pin);
+                if !moved { unimplemented!() }
             }
         }
-        let next = self.next.load(pin);
-        if ptr::eq(next.as_raw(), new) {
-            next.unwrap().move_contents_to(new, 0, pin)
+        let next = new.next.load(pin);
+        if let Some(next) = next.as_ref() {
+            new.move_contents_to(next, start_loc, pin)
         }
     }
 
@@ -494,6 +528,64 @@ impl<K, V, H> Table<K, V, H> {
                 self.next.load(pin).unwrap().remove(hash, q, pin)
             }
         }
+    }
+}
+
+unsafe fn move_cell<'p, K, V>(
+    old_cell: *mut Cell<K, V>,
+    new_table: *mut Cell<K, V>,
+    new_shift: u8,
+    mut key: OwnedKey<'p, K>,
+    pin: &'p Pin,
+) -> bool
+where K: PartialEq {
+    //FIXME handle running out of space (concurrent writes)
+    let mut new_cell = None;
+    'search: for new_off in search_path(key.0, new_shift) {
+        let cell = new_table.offset(new_off);
+        //FIXME handle key dealloc
+        match (*cell).key.try_fill_owned(key) {
+            Err((found, k)) => {
+                if found.as_ref() == Some(&*k) {
+                    new_cell = Some(cell);
+                    k.free(pin);
+                    break 'search
+                }
+                key = k
+            }
+            Ok(..) => {
+                new_cell = Some(cell);
+                break 'search
+            },
+        }
+    }
+    let new_cell = match new_cell {
+        Some(new_cell) => new_cell, None => return false,
+    };
+    let mut expected_new_val = ValPtr::empty();
+    'swap: loop {
+        //TODO we can remove this get by putting it outside the function
+        let old_val = (*old_cell).val.load_old(pin);
+        if !old_val.needs_move() {
+            return true
+        }
+        let got = (*new_cell).val.start_move(&expected_new_val, &old_val);
+        match got {
+            Ok(Some(owned)) => owned.free(pin),
+            Ok(None) => {},
+            Err(new_val) => {
+                expected_new_val = new_val;
+                continue 'swap
+            },
+        }
+        if (*old_cell).val.mark_as_moved(&old_val).is_err() {
+            continue 'swap
+        };
+        atomic::fence(Ordering::SeqCst); //TODO which ordering, and is this needed?
+        // If this suceeds we're done, if this failed someone raced us to the val
+        // and they'll finish the cell
+        let _ = (*new_cell).val.finish_move(old_val).is_ok();
+        return true
     }
 }
 
