@@ -1,5 +1,5 @@
 [package]
-name = "wait_free_hashmap"
+name = "click_map"
 version = "0.1.0"
 authors = ["Joshua Lockerman <>"]
 

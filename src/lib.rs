@@ -56,6 +56,7 @@ use std::sync::atomic::{self, Ordering};
 
 use coco::epoch::{self, Atomic, Pin, Ptr};
 
+#[derive(Clone)]
 pub struct HashMap<K, V, H = RandomState> {
     ptr: Arc<Atomic<Table<K, V, H>>>,
 }
@@ -87,13 +88,15 @@ where H: BuildHasher + Clone {
             key.hash(&mut hasher);
             let hash = hasher.finish();
             let key = Box::new((hash, key));
-            let val = Box::new(val);
+            let val = Box::new(ValBox{ val, _align: [] });
             let new_table = table.insert(key, val, pin);
             if let Some(new_table) = new_table {
                 let _ = pre.cas(table_ptr, new_table);
             }
         })
     }
+
+    //TODO insert_and?
 }
 
 impl<K, V, H> HashMap<K, V, H> {
@@ -116,7 +119,7 @@ impl<K, V, H> HashMap<K, V, H> {
     pub fn remove<Q>(&self, key: &Q)
     where
         H: BuildHasher,
-        K: Borrow<Q>,
+        K: Borrow<Q> + PartialEq,
         Q: Hash + Eq, {
         epoch::pin(|pin| {
             let table = self.ptr.load(pin).unwrap();
@@ -126,6 +129,8 @@ impl<K, V, H> HashMap<K, V, H> {
             table.remove(hash, key, pin)
         })
     }
+
+    //TODO remove_and?
 }
 
 struct Table<K, V, H> {
@@ -146,7 +151,13 @@ struct KeyPtr<K> {
 }
 
 struct ValPtr<V> {
-    ptr: Atomic<V>,
+    ptr: Atomic<ValBox<V>>,
+}
+
+struct ValBox<V> {
+    val: V,
+    //FIXME replace with something guarenteed to be > 4bit aligned on 32bit
+    _align: [&'static u8; 0],
 }
 
 impl<K, V> Cell<K, V> {
@@ -238,9 +249,9 @@ impl<'p, K: 'p> ::std::ops::Deref for OwnedKey<'p, K> {
 }
 
 const MOVING: usize = 1;
-
+const MOVED: usize = 4;
 const TOMBSTONE: usize = 2;
-const MOVED: usize = 3;
+
 
 enum ValPtrGetErr {
     Nothing,
@@ -249,7 +260,7 @@ enum ValPtrGetErr {
 }
 
 impl<V> ValPtr<V> {
-    fn swap<'p>(&self, val: Box<V>, pin: &'p Pin) -> OwnedVal<'p, V> {
+    fn swap<'p>(&self, val: Box<ValBox<V>>, pin: &'p Pin) -> OwnedVal<'p, V> {
         let old = self.ptr.swap_box(val, 0, pin);
         match old.tag() {
             TOMBSTONE => OwnedVal::Empty,
@@ -264,7 +275,7 @@ impl<V> ValPtr<V> {
         let ptr = self.ptr.load(pin);
         let raw = ptr.as_raw() as usize;
         if raw != TOMBSTONE && raw != MOVED {
-            ptr.as_ref().ok_or_else(|| Nothing)
+            ptr.as_ref().map(|v| &v.val).ok_or_else(|| Nothing)
         } else if raw == TOMBSTONE {
             Err(Tombstone)
         } else {
@@ -277,7 +288,7 @@ impl<V> ValPtr<V> {
     }
 
     fn start_move<'p>(&self, current: &NewVal<'p, V>, new: &OldVal<'p, V>)
-    -> Result<Option<Owned<'p, V>>, NewVal<'p, V>> {
+    -> Result<Option<Owned<'p, ValBox<V>>>, NewVal<'p, V>> {
          match self.ptr.cas(current.0, new.moving().0) {
              Ok(()) if current.is_owned() => Ok(Some(Owned(current.0))),
              Ok(()) => Ok(None),
@@ -300,12 +311,16 @@ impl<V> ValPtr<V> {
     fn remove(&self, pin: &Pin) -> Result<(), ValPtrGetErr> {
         use ValPtrGetErr::*;
         let old = self.ptr.swap(Ptr::null(TOMBSTONE));
-        //TODO free old
         match old.tag() {
             TOMBSTONE => Err(Tombstone),
             MOVED => Err(Moved),
+            MOVING => Err(Nothing),
             _ if old.is_null() => Err(Nothing),
-            _ => Ok(()),
+            //TODO check
+            _ => unsafe {
+                epoch::defer_free(old.as_raw(), 1, pin);
+                Ok(())
+            },
         }
     }
 
@@ -318,7 +333,7 @@ impl<V> ValPtr<V> {
 enum OwnedVal<'p, V:'p> {
     Empty,
     Moved,
-    Owned(Owned<'p, V>)
+    Owned(Owned<'p, ValBox<V>>)
 }
 
 #[must_use]
@@ -331,7 +346,7 @@ impl<'p, T: 'p> Owned<'p, T> {
 }
 
 #[must_use]
-struct NewVal<'p, V:'p>(Ptr<'p, V>);
+struct NewVal<'p, V:'p>(Ptr<'p, ValBox<V>>);
 
 impl<'p, V: 'p> NewVal<'p, V> {
     fn is_owned(&self) -> bool {
@@ -340,26 +355,33 @@ impl<'p, V: 'p> NewVal<'p, V> {
 }
 
 #[must_use]
-struct OldVal<'p, V:'p>(Ptr<'p, V>);
+struct OldVal<'p, V:'p>(Ptr<'p, ValBox<V>>);
 
 impl<'p, V:'p> OldVal<'p, V> {
     fn needs_move(&self) -> bool {
         self.0.tag() == 0 && !self.0.is_null()
     }
 
+    fn cannot_move(&self) -> bool {
+        let tag = self.0.tag();
+        tag == MOVED || tag == MOVING || (self.0.is_null() && tag != TOMBSTONE)
+    }
+
     fn is_tombstone(&self) -> bool {
-        self.0.tag() == TOMBSTONE && !self.0.is_null()
+        self.0.tag() == TOMBSTONE
     }
 
     fn moving(&self) -> Self {
-        OldVal(self.0.with_tag(MOVING))
+        //we want to be able to move tombstones
+        let old_tag = self.0.tag();
+        OldVal(self.0.with_tag(MOVING | old_tag))
     }
 }
 
 impl<K, V, H> Table<K, V, H>
 where H: Clone {
 
-    fn insert<'p>(&self, key: Box<(u64, K)>, val: Box<V>, pin: &'p Pin)
+    fn insert<'p>(&self, key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Pin)
     -> Option<Ptr<'p, Self>>
     where K: PartialEq {
         //TODO I think pre-checking breaks linearizability
@@ -396,15 +418,15 @@ where H: Clone {
         }
     }
 
-    fn try_emplace(&self, mut key: Box<(u64, K)>, val: Box<V>, pin: &Pin)
-    -> Result<isize, (isize, Box<(u64, K)>, Box<V>)>
+    fn try_emplace(&self, mut key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &Pin)
+    -> Result<isize, (isize, Box<(u64, K)>, Box<ValBox<V>>)>
     where K: PartialEq {
         //TODO defer_free
         //TODO use new key in new table so we can free old one
         unsafe {
             let table = self.table.load(pin).as_raw();
             let mut last = key.0 as isize;
-            for (i, _) in search_path(key.0, self.shift).zip(0..(1 << self.shift)) {
+            for i in search_path(key.0, self.shift).take(self.max_probe_len()) {
                 last = i;
                 let cell = table.offset(i);
                 match (*cell).key.try_fill(key) {
@@ -429,6 +451,91 @@ where H: Clone {
             }
             Err((last, key, val))
         }
+    }
+
+    fn alloc_next_table(&self) -> Box<Self> {
+        alloc_table(self.shift + 1, self.hasher.clone())
+    }
+}
+
+impl<K, V, H> Table<K, V, H> {
+    fn get<'p, Q>(&self, hash: u64, q: &Q, pin: &'p Pin) -> Option<&'p V>
+    where K: Borrow<Q>, Q: Eq {
+        use ValPtrGetErr::*;
+        unsafe {
+            let table = self.table.load(pin).as_raw();
+            let mut seach_next_table = false;
+            for i in search_path(hash, self.shift).take(self.capacity()) {
+                let cell = table.offset(i);
+                match (*cell).key.get(pin) {
+                    Some(k) if q.eq(k.borrow()) => {
+                        match (*cell).val.get(pin) {
+                            Ok(v) => return Some(v),
+                            Err(Nothing) | Err(Tombstone) => return None,
+                            Err(Moved) => {
+                                seach_next_table = true;
+                                break
+                            },
+                        }
+                    },
+                    Some(..) => continue,
+                    None => return None,
+                }
+            }
+            if seach_next_table {
+                self.next.load(pin).unwrap().get(hash, q, pin)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn remove<'p, Q>(&self, hash: u64, q: &Q, pin: &'p Pin)
+    where K: Borrow<Q> + PartialEq, Q: Eq {
+        use ValPtrGetErr::*;
+        unsafe {
+            let table = self.table.load(pin).as_raw();
+            for i in search_path(hash, self.shift).take(self.capacity()) {
+                let cell = table.offset(i);
+                match (*cell).key.get(pin) {
+                    // found our key
+                    Some(k) if q.eq(k.borrow()) => {
+                        match (*cell).val.remove(pin) {
+                            // If we removed val we need to try and propagate the removal to the net table
+                            Ok(..) => {
+                                if let Some(table) = self.next.load(pin).as_ref() {
+                                    //FIXME handle moving tombstones
+                                    self.move_tombstone(table, i, pin);
+                                }
+                                return
+                            },
+                            //if there was no val we're done
+                            Err(Tombstone) | Err(Nothing) => return,
+
+                            // If val was moved we need to check the next table
+                            Err(Moved) => { break },
+                        }
+                    },
+
+                    // not our key, keep looking
+                    Some(..) => continue,
+
+                    // key not found in table
+                    None => return,
+                }
+            }
+            self.next.load(pin).unwrap().remove(hash, q, pin)
+        }
+    }
+
+    unsafe fn move_tombstone<'p>(&self, new: &Self, tomb_loc: isize, pin: &'p Pin)
+    where K: PartialEq {
+        let old_table = self.table.load(pin).as_raw();
+        let old_cell = old_table.offset(tomb_loc);
+        let key = (*old_cell).key.start_move(pin).unwrap();
+        let new_table = new.table.load(pin).as_raw();
+        let new_shift = new.shift;
+        move_cell(old_cell, new_table, new_shift, key, pin);
     }
 
     //TODO only move until we reach a Moved, after that some other thread will move them
@@ -464,70 +571,14 @@ where H: Clone {
         }
     }
 
-    fn alloc_next_table(&self) -> Box<Self> {
-        alloc_table(self.shift + 1, self.hasher.clone())
-    }
-}
-
-impl<K, V, H> Table<K, V, H> {
-    fn get<'p, Q>(&self, hash: u64, q: &Q, pin: &'p Pin) -> Option<&'p V>
-    where K: Borrow<Q>, Q: Eq {
-        use ValPtrGetErr::*;
-        unsafe {
-            let table = self.table.load(pin).as_raw();
-            let mut seach_next_table = false;
-            for (i, _) in search_path(hash, self.shift).zip(0..(1 << self.shift)) {
-                let cell = table.offset(i);
-                match (*cell).key.get(pin) {
-                    Some(k) if q.eq(k.borrow()) => {
-                        match (*cell).val.get(pin) {
-                            Ok(v) => return Some(v),
-                            Err(Nothing) | Err(Tombstone) => return None,
-                            Err(Moved) => {
-                                seach_next_table = true;
-                                break
-                            },
-                        }
-                    },
-                    Some(..) => continue,
-                    None => return None,
-                }
-            }
-            if seach_next_table {
-                self.next.load(pin).unwrap().get(hash, q, pin)
-            } else {
-                None
-            }
-        }
+    #[inline(always)]
+    fn max_probe_len(&self) -> usize {
+        (1 << self.shift) / 2
     }
 
-    fn remove<'p, Q>(&self, hash: u64, q: &Q, pin: &'p Pin)
-    where K: Borrow<Q>, Q: Eq {
-        use ValPtrGetErr::*;
-        unsafe {
-            let table = self.table.load(pin).as_raw();
-            let mut seach_next_table = false;
-            for (i, _) in search_path(hash, self.shift).zip(0..(1 << self.shift)) {
-                let cell = table.offset(i);
-                match (*cell).key.get(pin) {
-                    Some(k) if q.eq(k.borrow()) => {
-                        match (*cell).val.remove(pin) {
-                            Ok(..) => return,
-                            Err(Nothing) | Err(Tombstone) => return,
-                            Err(Moved) => {
-                                seach_next_table = true;
-                                break
-                            },
-                        }
-                    },
-                    Some(..) => continue,
-                    None => return,
-                }
-            }
-            if seach_next_table {
-                self.next.load(pin).unwrap().remove(hash, q, pin)
-            }
-        }
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        (1 << self.shift)
     }
 }
 
@@ -535,38 +586,20 @@ unsafe fn move_cell<'p, K, V>(
     old_cell: *mut Cell<K, V>,
     new_table: *mut Cell<K, V>,
     new_shift: u8,
-    mut key: OwnedKey<'p, K>,
+    key: OwnedKey<'p, K>,
     pin: &'p Pin,
 ) -> bool
 where K: PartialEq {
     //FIXME handle running out of space (concurrent writes)
-    let mut new_cell = None;
-    'search: for new_off in search_path(key.0, new_shift) {
-        let cell = new_table.offset(new_off);
-        //FIXME handle key dealloc
-        match (*cell).key.try_fill_owned(key) {
-            Err((found, k)) => {
-                if found.as_ref() == Some(&*k) {
-                    new_cell = Some(cell);
-                    k.free(pin);
-                    break 'search
-                }
-                key = k
-            }
-            Ok(..) => {
-                new_cell = Some(cell);
-                break 'search
-            },
-        }
-    }
-    let new_cell = match new_cell {
+    //      (should not be a problem, we diallow new inserts until the move is done)
+    let new_cell = match find_new_cell(new_table, new_shift, key, pin) {
         Some(new_cell) => new_cell, None => return false,
     };
     let mut expected_new_val = ValPtr::empty();
     'swap: loop {
         //TODO we can remove this get by putting it outside the function
         let old_val = (*old_cell).val.load_old(pin);
-        if !old_val.needs_move() {
+        if old_val.cannot_move() {
             return true
         }
         let got = (*new_cell).val.start_move(&expected_new_val, &old_val);
@@ -587,6 +620,35 @@ where K: PartialEq {
         let _ = (*new_cell).val.finish_move(old_val).is_ok();
         return true
     }
+}
+
+unsafe fn find_new_cell<'p, K, V>(
+    new_table: *mut Cell<K, V>,
+    new_shift: u8,
+    mut key: OwnedKey<'p, K>,
+    pin: &'p Pin,
+) -> Option<*mut Cell<K, V>>
+where K: PartialEq {
+    let mut new_cell = None;
+    'search: for new_off in search_path(key.0, new_shift) {
+        let cell = new_table.offset(new_off);
+        //FIXME handle key dealloc
+        match (*cell).key.try_fill_owned(key) {
+            Err((found, k)) => {
+                if found.as_ref() == Some(&*k) {
+                    new_cell = Some(cell);
+                    k.free(pin);
+                    break 'search
+                }
+                key = k
+            }
+            Ok(..) => {
+                new_cell = Some(cell);
+                break 'search
+            },
+        }
+    }
+    new_cell
 }
 
 fn alloc_table<K, V, H>(shift: u8, hasher: H) -> Box<Table<K, V, H>> {
