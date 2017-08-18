@@ -2,46 +2,10 @@
 //! A lock-free hashtable based on Clif Click's
 //! [A Fast Wait-Free Hash Table](https://www.youtube.com/watch?v=WYXgtXWejRM)
 //!
-//! Note that the table is __not__ wait-free;
-//! a thread can race resizing and never reach a cannonical table.
+//! Note that this implementation table is __not__ wait-free;
+//! a thread can race resizing and never reach a cannonical table,
+//! and may not linearizable.
 //!
-
-// There are issues with freeing keys and values from the map due to resizing:
-// assume we have a map
-//
-// ```root -> [(A, 1) | (B, 32) | (empty) | (C, Tombstone)]```
-//
-// during a resize we can end up with writers pointing to both the old a new maps
-// ```
-// root -> [(A, 1) | (B, 32) | (empty) | (C, Tombstone)]
-//
-// root, writer -> [(A, 1) | (B, 32) | (empty) | (C, Tombstone)]
-//
-// root, writer, resizer -> [(A, 1) | (B, 32) | (empty) | (C, Tombstone)]
-//
-// root, writer, -> [(A, 1) | (B, 32) | (empty) | (C, Tombstone)]-\
-//                                                                 |
-//       resizer -> [(A, 1) | (B, 32) | (empty) | (C, Tombstone)]</
-//
-//       writer, -> [(A, 1) | (B, 32) | (empty) | (C, Tombstone)]-\
-//                                                                 |
-// root, resizer -> [(A, 1) | (B, 32) | (empty) | (empty)]<-------/
-//
-// writer, -> [(A, 1) | (B, 32) | (empty) | (C, Tombstone)]-\
-//                                                           |
-//    root -> [(A, 1) | (B, 32) | (empty) | (empty)]<-------/
-// ```
-//
-// This means that if a writer sees a value in the new map,
-// it has no way to tell if the value is pre-resize or new.
-// This is an issue b/c we want to ensure defer_free is called
-// exactly once on each pointer.
-// If a key is found in the old map, a thread that found it there
-// should be the one to free it b/c the key may never make it to the
-// new map. While if a key is only found in the new map, a thread that
-// found it there must be the one to free it.
-//
-// We can tell for vals due to swap and 2pc, I think we need to realloc the keys?
 #![deny(unused_must_use)]
 
 extern crate coco;
@@ -58,6 +22,7 @@ use coco::epoch::{self, Atomic, Pin, Ptr};
 
 #[derive(Clone)]
 pub struct HashMap<K, V, H = RandomState> {
+    //TODO we should probably have the Arc be a user responsibility
     ptr: Arc<Atomic<Table<K, V, H>>>,
 }
 
@@ -147,6 +112,8 @@ struct Cell<K, V> {
 }
 
 struct KeyPtr<K> {
+    //FIXME we need to guarentee that this pointer is alinged enough
+    //      to fit the flags.
     ptr: Atomic<(u64, K)>,
 }
 
