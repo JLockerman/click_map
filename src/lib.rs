@@ -86,12 +86,21 @@ impl<K, V, H> HashMap<K, V, H> {
         H: BuildHasher,
         K: Borrow<Q> + PartialEq,
         Q: Hash + Eq, {
+        self.remove_and(key, |_| ());
+    }
+
+    pub fn remove_and<Q, F, T>(&self, key: &Q, f: F) -> Option<T>
+    where
+        H: BuildHasher,
+        K: Borrow<Q> + PartialEq,
+        Q: Hash + Eq,
+        F: FnOnce(&V) -> T {
         epoch::pin(|pin| {
             let table = self.ptr.load(pin).unwrap();
             let mut hasher = table.hasher.build_hasher();
             key.hash(&mut hasher);
             let hash = hasher.finish();
-            table.remove(hash, key, pin)
+            table.remove_and(hash, key, pin, f)
         })
     }
 
@@ -275,19 +284,24 @@ impl<V> ValPtr<V> {
         }
     }
 
-    fn remove(&self, pin: &Pin) -> Result<(), ValPtrGetErr> {
+    fn remove_and<F, T>(&self, pin: &Pin, f: F) -> Result<T, (ValPtrGetErr, F)>
+    where F: FnOnce(&V) -> T, {
         use ValPtrGetErr::*;
         let old = self.ptr.swap(Ptr::null(TOMBSTONE));
         match old.tag() {
-            TOMBSTONE => Err(Tombstone),
-            MOVED => Err(Moved),
-            MOVING => Err(Nothing),
-            _ if old.is_null() => Err(Nothing),
+            TOMBSTONE => Err((Tombstone, f)),
+            MOVED => Err((Moved, f)),
+            MOVING => Err((Nothing, f)),
+            _ if old.is_null() => Err((Nothing, f)),
             //TODO check
-            _ => unsafe {
-                epoch::defer_free(old.as_raw(), 1, pin);
-                Ok(())
-            },
+            _ => match old.as_ref() {
+                None => Err((Nothing, f)),
+                Some(v) => unsafe {
+                    let t = f(&v.val);
+                    epoch::defer_free(old.as_raw(), 1, pin);
+                    Ok(t)
+                },
+            }
         }
     }
 
@@ -457,8 +471,11 @@ impl<K, V, H> Table<K, V, H> {
         }
     }
 
-    fn remove<'p, Q>(&self, hash: u64, q: &Q, pin: &'p Pin)
-    where K: Borrow<Q> + PartialEq, Q: Eq {
+    fn remove_and<'p, Q, F, T>(&self, hash: u64, q: &Q, pin: &'p Pin, mut f: F) -> Option<T>
+    where
+        K: Borrow<Q> + PartialEq,
+        Q: Eq,
+        F: FnOnce(&V) -> T, {
         use ValPtrGetErr::*;
         unsafe {
             let table = self.table.load(pin).as_raw();
@@ -467,20 +484,23 @@ impl<K, V, H> Table<K, V, H> {
                 match (*cell).key.get(pin) {
                     // found our key
                     Some(k) if q.eq(k.borrow()) => {
-                        match (*cell).val.remove(pin) {
+                        match (*cell).val.remove_and(pin, f) {
                             // If we removed val we need to try and propagate the removal to the net table
-                            Ok(..) => {
+                            Ok(t) => {
                                 if let Some(table) = self.next.load(pin).as_ref() {
                                     //FIXME handle moving tombstones
                                     self.move_tombstone(table, i, pin);
                                 }
-                                return
+                                return Some(t)
                             },
                             //if there was no val we're done
-                            Err(Tombstone) | Err(Nothing) => return,
+                            Err((Tombstone, _)) | Err((Nothing, _)) => return None,
 
                             // If val was moved we need to check the next table
-                            Err(Moved) => { break },
+                            Err((Moved, g)) => {
+                                f = g;
+                                break
+                            },
                         }
                     },
 
@@ -488,10 +508,10 @@ impl<K, V, H> Table<K, V, H> {
                     Some(..) => continue,
 
                     // key not found in table
-                    None => return,
+                    None => return None,
                 }
             }
-            self.next.load(pin).unwrap().remove(hash, q, pin)
+            self.next.load(pin).unwrap().remove_and(hash, q, pin, f)
         }
     }
 
