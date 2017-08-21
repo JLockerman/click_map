@@ -6,6 +6,8 @@
 //! a thread can race resizing and never reach a cannonical table,
 //! and may not linearizable.
 //!
+
+// FIXME ensure that boxes have no pointees before they're freed
 #![deny(unused_must_use)]
 
 extern crate coco;
@@ -43,8 +45,15 @@ impl<K, V> HashMap<K, V, RandomState> {
 
 impl<K, V, H> HashMap<K, V, H>
 where H: BuildHasher + Clone {
-    pub fn insert(&self, key: K, val: V)
+    pub fn insert(&self, key: K, val: V) -> bool
     where K: PartialEq + Hash {
+        self.insert_and(key, val, |_| ()).is_some()
+    }
+
+    pub fn insert_and<F, T>(&self, key: K, val: V, f: F) -> Option<T>
+    where
+        K: PartialEq + Hash,
+        F: for<'v >FnOnce(&'v V) -> T, {
         let pre = &*self.ptr;
         epoch::pin(|pin| {
             let table_ptr = pre.load(pin);
@@ -54,14 +63,25 @@ where H: BuildHasher + Clone {
             let hash = hasher.finish();
             let key = Box::new((hash, key));
             let val = Box::new(ValBox{ val, _align: [] });
-            let new_table = table.insert(key, val, pin);
+            let (new_table, old_val) = table.insert(key, val, pin);
+            let mut need_flush = false;
             if let Some(new_table) = new_table {
                 let _ = pre.cas(table_ptr, new_table);
+                need_flush = true;
             }
+            let t = match old_val {
+                OwnedVal::Owned(v) => {
+                    let t = v.0.as_ref().map(|v| f(&v.val));
+                    v.free(pin);
+                    need_flush = true;
+                    t
+                }
+                _ => None
+            };
+            if need_flush { epoch::flush(pin) }
+            t
         })
     }
-
-    //TODO insert_and?
 }
 
 impl<K, V, H> HashMap<K, V, H> {
@@ -363,7 +383,7 @@ impl<K, V, H> Table<K, V, H>
 where H: Clone {
 
     fn insert<'p>(&self, key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Pin)
-    -> Option<Ptr<'p, Self>>
+    -> (Option<Ptr<'p, Self>>, OwnedVal<'p, V>)
     where K: PartialEq {
         //TODO I think pre-checking breaks linearizability
         //if let Some(table) = self.next.load(pin).as_ref() {
@@ -375,32 +395,32 @@ where H: Clone {
             // have already bypassed.
             // Furthermore, next should be on the same cacheline as table,
             // meaning this will likely only cause a miss if somone started a resize.
-            Ok(loc) => {
+            Ok((loc, old)) => {
                 let ptr = self.next.load(pin);
                 if let Some(table) = ptr.as_ref() {
                     self.move_contents_to(table, loc, pin);
-                    return Some(ptr)
+                    return (Some(ptr), old)
                 }
-                return None
+                return (None, old)
             },
             Err((last, key, val)) => {
                 let new_table = self.alloc_next_table();
                 let next = self.next.cas_box(Ptr::null(0), new_table, 0);
                 let table = match next { Ok(p) | Err((p, _)) => p, };
                 let t = table.unwrap();
-                t.insert(key, val, pin);
                 self.move_contents_to(t, last, pin);
                 unsafe {
-                    epoch::defer_free(self.table.load(pin).as_raw(), 1 << self.shift, pin);
+                    epoch::defer_free(self.table.load(pin).as_raw(), self.capacity(), pin);
                     epoch::defer_free(self as *const Self as *mut Self, 1, pin);
                 }
-                Some(table)
+                let (new_table, old_val) = t.insert(key, val, pin);
+                (new_table.or(Some(table)), old_val)
             },
         }
     }
 
-    fn try_emplace(&self, mut key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &Pin)
-    -> Result<isize, (isize, Box<(u64, K)>, Box<ValBox<V>>)>
+    fn try_emplace<'p>(&self, mut key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Pin)
+    -> Result<(isize, OwnedVal<'p, V>), (isize, Box<(u64, K)>, Box<ValBox<V>>)>
     where K: PartialEq {
         //TODO defer_free
         //TODO use new key in new table so we can free old one
@@ -413,19 +433,13 @@ where H: Clone {
                 match (*cell).key.try_fill(key) {
                     Ok(..) => {
                         let old = (*cell).val.swap(val, pin);
-                        if let OwnedVal::Owned(o) = old {
-                            o.free(pin)
-                        }
-                        return Ok(i)
+                        return Ok((i, old))
                     }
                     Err((found, k)) => {
                         key = k;
                         if found.as_ref().map(|f| f == &*key).unwrap_or_else(|| false) {
                             let old = (*cell).val.swap(val, pin);
-                            if let OwnedVal::Owned(o) = old {
-                                o.free(pin)
-                            }
-                            return Ok(i)
+                            return Ok((i, old))
                         }
                     },
                 }
@@ -484,6 +498,7 @@ impl<K, V, H> Table<K, V, H> {
                 match (*cell).key.get(pin) {
                     // found our key
                     Some(k) if q.eq(k.borrow()) => {
+                        //FIXME free should be done after move_contents_to?
                         match (*cell).val.remove_and(pin, f) {
                             // If we removed val we need to try and propagate the removal to the net table
                             Ok(t) => {
