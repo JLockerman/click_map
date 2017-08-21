@@ -4,4 +4,4 @@ version = "0.1.0"
 authors = ["Joshua Lockerman <>"]
 
 [dependencies]
-coco = "0.1.1"
+coco = { git = "https://github.com/JLockerman/coco" }
