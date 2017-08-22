@@ -10,18 +10,19 @@
 // FIXME ensure that boxes have no pointees before they're freed
 #![deny(unused_must_use)]
 
-extern crate coco;
+pub extern crate coco;
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{drop, forget};
-use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
 use Ordering::*;
 
 use coco::epoch::{self, Atomic, Scope, Owned as Box, Ptr};
+
+mod fmt;
 
 #[derive(Clone)]
 pub struct HashMap<K, V, H = RandomState> {
@@ -48,13 +49,13 @@ impl<K, V> HashMap<K, V, RandomState> {
 impl<K, V, H> HashMap<K, V, H>
 where H: BuildHasher + Clone {
     pub fn insert(&self, key: K, val: V) -> bool
-    where K: PartialEq + Hash {
+    where K: Clone + PartialEq + Hash {
         self.insert_and(key, val, |_| ()).is_some()
     }
 
     pub fn insert_and<F, T>(&self, key: K, val: V, f: F) -> Option<T>
     where
-        K: PartialEq + Hash,
+        K: Clone + PartialEq + Hash,
         F: for<'v >FnOnce(&'v V) -> T, {
         let pre = &*self.ptr;
         epoch::pin(|pin| {
@@ -75,7 +76,6 @@ where H: BuildHasher + Clone {
                 OwnedVal::Owned(v) => unsafe {
                     let t = v.0.as_ref().map(|v| f(&v.val));
                     v.free(pin);
-                    need_flush = true;
                     t
                 },
                 _ => None
@@ -83,6 +83,18 @@ where H: BuildHasher + Clone {
             if need_flush { pin.flush() }
             t
         })
+    }
+
+    pub fn gc_tombstones(&self)
+    where K: Clone + PartialEq{
+        let pre = &*self.ptr;
+        epoch::pin(|pin| {
+            let table_ptr = pre.load(Acquire, pin);
+            let table = unsafe { table_ptr.deref() };
+            let new_table = table.gc_tombstones(pin);
+            let _ = pre.compare_and_swap(table_ptr, new_table, AcqRel, pin);
+            pin.flush();
+        });
     }
 }
 
@@ -106,7 +118,7 @@ impl<K, V, H> HashMap<K, V, H> {
     pub fn remove<Q>(&self, key: &Q)
     where
         H: BuildHasher,
-        K: Borrow<Q> + PartialEq,
+        K: Borrow<Q> + Clone + PartialEq,
         Q: Hash + Eq, {
         self.remove_and(key, |_| ());
     }
@@ -114,7 +126,7 @@ impl<K, V, H> HashMap<K, V, H> {
     pub fn remove_and<Q, F, T>(&self, key: &Q, f: F) -> Option<T>
     where
         H: BuildHasher,
-        K: Borrow<Q> + PartialEq,
+        K: Borrow<Q> + Clone + PartialEq,
         Q: Hash + Eq,
         F: FnOnce(&V) -> T {
         epoch::pin(|pin| {
@@ -122,11 +134,10 @@ impl<K, V, H> HashMap<K, V, H> {
             let mut hasher = table.hasher.build_hasher();
             key.hash(&mut hasher);
             let hash = hasher.finish();
-            table.remove_and(hash, key, pin, f)
+            let t = table.remove_and(hash, key, pin, f);
+            t
         })
     }
-
-    //TODO remove_and?
 }
 
 struct Table<K, V, H> {
@@ -177,11 +188,16 @@ impl<K> KeyPtr<K> {
     fn try_fill_owned<'p>(&self, key: OwnedKey<'p, K>, pin: &'p Scope)
     -> Result<(), (Ptr<'p, (u64, K)>, OwnedKey<'p, K>)> {
         match key {
-            OwnedKey::Boxed(key) => self.ptr.compare_and_swap_owned(KeyPtr::empty(), key, AcqRel, pin)
+            OwnedKey::Boxed(key) => self.ptr
+                .compare_and_swap_owned(KeyPtr::empty(), key, AcqRel, pin)
                 .map(|_| ())
                 .map_err(|(p, k)| (p, OwnedKey::Boxed(k))),
-            OwnedKey::Ptr(key) => self.ptr.compare_and_swap(KeyPtr::empty(), key.0, AcqRel, pin)
-                .map_err(|p| (p, OwnedKey::Ptr(key))),
+            OwnedKey::Ptr(key) => {
+                let key = key.into_ptr();
+                self.ptr
+                    .compare_and_swap(KeyPtr::empty(), key, AcqRel, pin)
+                    .map_err(|p| (p, OwnedKey::Ptr(Owned(key))))
+            },
         }
     }
 
@@ -189,21 +205,32 @@ impl<K> KeyPtr<K> {
         unsafe { self.ptr.load(Acquire, pin).as_ref().map(|&(_, ref k)| k) }
     }
 
+    fn hash_and_key<'p>(&self, pin: &'p Scope) -> Option<&'p (u64, K)> {
+        unsafe { self.ptr.load(Acquire, pin).as_ref() }
+    }
+
     fn load<'p>(&self, pin: &'p Scope) -> Ptr<'p, (u64, K)> {
         self.ptr.load(Acquire, pin)
     }
 
     fn start_move<'p>(&self, pin: &'p Scope)
-    -> Option<OwnedKey<'p, K>> {
+    -> Option<OwnedKey<'p, K>>
+    where K: Clone, {
         let original = self.load(pin);
         if original.is_null() { return None }
+
+        fn duplicate_key<'p, K: Clone>(original: Ptr<'p, (u64, K)>) -> OwnedKey<'p, K> {
+            let clone = unsafe {<(u64, K) as Clone>::clone(original.deref())};
+            OwnedKey::Boxed(Box::new(clone))
+        }
+
         match original.tag() {
-            TOMBSTONE | MOVED => return Some(OwnedKey::Boxed(Box::new(unsafe { ptr::read(original.as_raw()) }))),
+            TOMBSTONE | MOVED => return Some(duplicate_key(original)),
             _ => (),
         }
         match self.ptr.compare_and_swap(original, original.with_tag(MOVED), AcqRel, pin) {
             Ok(()) => Some(OwnedKey::Ptr(Owned(original))),
-            Err(..) => Some(OwnedKey::Boxed(Box::new(unsafe { ptr::read(original.as_raw()) }))),
+            Err(..) => Some(duplicate_key(original)),
         }
     }
 
@@ -229,9 +256,8 @@ enum OwnedKey<'p, K: 'p> {
 impl<'p, K: 'p> OwnedKey<'p, K> {
     fn free(self, pin: &'p Scope) {
         match self {
-            //FIXME we never drop keys atm
-            OwnedKey::Boxed(b) => unsafe {pin.defer_drop(b.into_ptr(pin))},
-            OwnedKey::Ptr(p) => unsafe {pin.defer_drop(p.0)},
+            OwnedKey::Boxed(b) => unsafe { pin.defer_drop(b.into_ptr(pin)) },
+            OwnedKey::Ptr(p) => unsafe { pin.defer_drop(p.0) },
         }
     }
 }
@@ -250,7 +276,7 @@ const MOVING: usize = 1;
 const MOVED: usize = 4;
 const TOMBSTONE: usize = 2;
 
-
+#[derive(Debug)]
 enum ValPtrGetErr {
     Nothing,
     Tombstone,
@@ -349,6 +375,19 @@ struct Owned<'p, T: 'p>(Ptr<'p, T>);
 impl<'p, T: 'p> Owned<'p, T> {
     fn free(self, pin: &'p Scope) {
         unsafe { pin.defer_drop(self.0) }
+        forget(self)
+    }
+
+    fn into_ptr(self) -> Ptr<'p, T> {
+        let ptr = self.0;
+        forget(self);
+        ptr
+    }
+}
+
+impl<'p, T> Drop for Owned<'p, T> {
+    fn drop(&mut self) {
+        unreachable!("Owned must be used.")
     }
 }
 
@@ -390,7 +429,7 @@ where H: Clone {
 
     fn insert<'p>(&self, key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Scope)
     -> (Option<Ptr<'p, Self>>, OwnedVal<'p, V>)
-    where K: PartialEq {
+    where K: Clone + PartialEq {
         //TODO I think pre-checking breaks linearizability
         //if let Some(table) = self.next.load(pin).as_ref() {
         //    return table.insert(key, val, pin)
@@ -429,8 +468,6 @@ where H: Clone {
     fn try_emplace<'p>(&self, mut key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Scope)
     -> Result<(isize, OwnedVal<'p, V>), (isize, Box<(u64, K)>, Box<ValBox<V>>)>
     where K: PartialEq {
-        //TODO defer_free
-        //TODO use new key in new table so we can free old one
         unsafe {
             let table = self.table.load(Acquire, pin).as_raw();
             let mut last = key.0 as isize;
@@ -455,6 +492,21 @@ where H: Clone {
         }
     }
 
+    fn gc_tombstones<'p>(&self, pin: &'p Scope) -> Ptr<'p, Self>
+    where K: Clone + PartialEq {
+        let new_table = alloc_table(self.shift, self.hasher.clone());
+        let next = self.next.compare_and_swap_owned(Ptr::null(), new_table, AcqRel, pin);
+        let table = match next { Ok(p) | Err((p, _)) => p, };
+        let t = unsafe { table.deref() };
+        self.move_contents_to(t, 0, pin);
+        //FIXME do this in caller after CAS
+        unsafe {
+            pin.defer_free_array(self.table.load(Acquire, pin), self.capacity());
+            pin.defer_free(Ptr::from_raw(self));
+        }
+        table
+    }
+
     fn alloc_next_table(&self) -> Box<Self> {
         alloc_table(self.shift + 1, self.hasher.clone())
     }
@@ -469,8 +521,8 @@ impl<K, V, H> Table<K, V, H> {
             let mut seach_next_table = false;
             for i in search_path(hash, self.shift).take(self.capacity()) {
                 let cell = table.offset(i);
-                match (*cell).key.get(pin) {
-                    Some(k) if q.eq(k.borrow()) => {
+                match (*cell).key.hash_and_key(pin) {
+                    Some(&(ref h, ref k)) if hash == *h && q.eq(k.borrow()) => {
                         match (*cell).val.get(pin) {
                             Ok(v) => return Some(v),
                             Err(Nothing) | Err(Tombstone) => return None,
@@ -494,7 +546,7 @@ impl<K, V, H> Table<K, V, H> {
 
     fn remove_and<'p, Q, F, T>(&self, hash: u64, q: &Q, pin: &'p Scope, mut f: F) -> Option<T>
     where
-        K: Borrow<Q> + PartialEq,
+        K: Borrow<Q> + Clone + PartialEq,
         Q: Eq,
         F: FnOnce(&V) -> T, {
         use ValPtrGetErr::*;
@@ -502,9 +554,9 @@ impl<K, V, H> Table<K, V, H> {
             let table = self.table.load(Acquire, pin).as_raw();
             for i in search_path(hash, self.shift).take(self.capacity()) {
                 let cell = table.offset(i);
-                match (*cell).key.get(pin) {
+                match (*cell).key.hash_and_key(pin) {
                     // found our key
-                    Some(k) if q.eq(k.borrow()) => {
+                    Some(&(ref h, ref k)) if hash == *h && q.eq(k.borrow()) => {
                         //FIXME free should be done after move_contents_to?
                         match (*cell).val.remove_and(pin, f) {
                             // If we removed val we need to try and propagate the removal to the net table
@@ -538,7 +590,7 @@ impl<K, V, H> Table<K, V, H> {
     }
 
     unsafe fn move_tombstone<'p>(&self, new: &Self, tomb_loc: isize, pin: &'p Scope)
-    where K: PartialEq {
+    where K: Clone + PartialEq {
         let old_table = self.table.load(Acquire, pin).as_raw();
         let old_cell = old_table.offset(tomb_loc);
         let key = (*old_cell).key.start_move(pin).unwrap();
@@ -550,7 +602,7 @@ impl<K, V, H> Table<K, V, H> {
     //TODO only move until we reach a Moved, after that some other thread will move them
     //     but how do we know when the map is finished?
     fn move_contents_to(&self, new: &Self, start_loc: isize, pin: &Scope)
-    where K: PartialEq {
+    where K: Clone + PartialEq {
         let old_table = self.table.load(Acquire, pin).as_raw();
         let new_table = new.table.load(Acquire, pin).as_raw();
         let new_shift = new.shift;
