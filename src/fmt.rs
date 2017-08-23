@@ -22,13 +22,13 @@ where K: fmt::Debug, V: fmt::Debug {
     fn fmt(&self, f: &mut Formatter) -> Result {
         epoch::pin(|pin| unsafe {
             let mut debug = f.debug_map();
-            let ptr = self.table.load(Ordering::Acquire, pin);
-            for cell in slice::from_raw_parts(ptr.as_raw(), self.capacity()) {
-                if let Some(key) = cell.key.get(pin) {
-                // if let Some(key) = cell.key.hash_and_key(pin) {
-                    debug.entry(key, &cell.val.get(pin));
+            let ptr = self.cells.load(Ordering::Acquire, pin);
+            for cell_bucket in slice::from_raw_parts(ptr.as_raw(), self.capacity()) {
+                for cell in cell_bucket {
+                    if let Some(key) = cell.key.get(pin) {
+                        debug.entry(key, &cell.val.get(pin));
+                    }
                 }
-
             }
             debug.finish()
         })
