@@ -155,13 +155,12 @@ impl<K, V, H> HashMap<K, V, H> {
 impl<K, V, H> Drop for HashMap<K, V, H> {
     fn drop(&mut self) {
         use ::std::slice;
-        println!("mpa drop");
         epoch::pin(|pin| unsafe {
             let table = self.ptr.load(Acquire, pin).deref();
             let cells = table.table.load(Acquire, pin).deref();
             let cells = slice::from_raw_parts(cells, table.capacity());
             for cell in cells {
-                let _ = cell.val.remove_and(pin, |v| ());//println!("dropping {:?}", v)
+                let _ = cell.val.remove_and(pin, |_| ());
                 cell.key.try_free(pin);
             }
             pin.defer_free_array(table.table.load(Acquire, pin), table.capacity());
