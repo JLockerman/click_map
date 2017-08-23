@@ -18,8 +18,8 @@ fn test_insert() {
     let m = HashMap::new();
     m.insert(1, 2);
     m.insert(2, 4);
-    m.get_and(&1,|v| assert_eq!(v, &2)).unwrap();
-    m.get_and(&2,|v| assert_eq!(v, &4)).unwrap();
+    m.get_then(&1,|v| assert_eq!(v, &2)).unwrap();
+    m.get_then(&2,|v| assert_eq!(v, &4)).unwrap();
 }
 
 /*#[test]
@@ -28,8 +28,8 @@ fn test_clone() {
     m.insert(1, 2);
     m.insert(2, 4);
     let m2 = m.clone();
-    m2.get_and(&1,|v| assert_eq!(v, &2)).unwrap();
-    m2.get_and(&2,|v| assert_eq!(v, &4)).unwrap();
+    m2.get_then(&1,|v| assert_eq!(v, &2)).unwrap();
+    m2.get_then(&2,|v| assert_eq!(v, &4)).unwrap();
 }*/
 
 #[test]
@@ -47,19 +47,19 @@ fn test_lots_of_insertions() {
             for j in 1..i + 1 {
                 // let r = m.get(&j);
                 // assert_eq!(r, Some(&j));
-                assert_eq!(m.get_and(&j,|&v| v), Some(j));
+                assert_eq!(m.get_then(&j,|&v| v), Some(j));
             }
 
             for j in i + 1..1001 {
                 // let r = m.get(&j);
                 // assert_eq!(r, None);
-                assert_eq!(m.get_and(&j,|&v| v), None);
+                assert_eq!(m.get_then(&j,|&v| v), None);
             }
         }
 
         for i in 1001..2001 {
             // assert!(!m.contains_key(&i));
-            assert_eq!(m.get_and(&i, |&v| v), None);
+            assert_eq!(m.get_then(&i, |&v| v), None);
         }
 
         // remove forwards
@@ -69,18 +69,18 @@ fn test_lots_of_insertions() {
 
             for j in 1..i + 1 {
                 // assert!(!m.contains_key(&j));
-                assert_eq!(m.get_and(&j,|&v| v), None);
+                assert_eq!(m.get_then(&j,|&v| v), None);
             }
 
             for j in i + 1..1001 {
                 // assert!(m.contains_key(&j));
-                assert_eq!(m.get_and(&j,|&v| v), Some(j));
+                assert_eq!(m.get_then(&j,|&v| v), Some(j));
             }
         }
         coco::epoch::pin(|s| s.flush());
 
         for i in 1..1001 {
-            assert_eq!(m.get_and(&i,|&v| v), None);
+            assert_eq!(m.get_then(&i,|&v| v), None);
         }
 
         for i in 1..1001 {
@@ -95,12 +95,12 @@ fn test_lots_of_insertions() {
 
             for j in i..1001 {
                 // assert!(!m.contains_key(&j));
-                assert_eq!(m.get_and(&j,|&v| v), None);
+                assert_eq!(m.get_then(&j,|&v| v), None);
             }
 
             for j in 1..i {
                 // assert!(m.contains_key(&j));
-                assert_eq!(m.get_and(&j,|&v| v), Some(j));
+                assert_eq!(m.get_then(&j,|&v| v), Some(j));
             }
         }
         coco::epoch::pin(|s| s.flush());
@@ -185,7 +185,7 @@ mod drop_tests {
                     });
                 });
                 assert!(v.is_some());
-                assert!(m.get_and(&k, |_| ()).is_none());
+                assert!(m.get_then(&k, |_| ()).is_none());
                 drop(k);
                 coco::epoch::pin(|s| s.flush());
             }

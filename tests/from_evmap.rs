@@ -33,7 +33,7 @@ fn busybusybusy_inner(slow: bool) {
                 for i in 0..n {
                     let i = i.into();
                     loop {
-                        match map.get_and(&i, |rs| {
+                        match map.get_then(&i, |rs| {
                             if slow {
                                 thread::sleep(time::Duration::from_millis(2));
                             }

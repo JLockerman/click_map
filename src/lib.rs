@@ -2,9 +2,48 @@
 //! A lock-free hashtable based on Clif Click's
 //! [A Fast Wait-Free Hash Table](https://www.youtube.com/watch?v=WYXgtXWejRM)
 //!
-//! Note that this implementation table is __not__ wait-free;
+//! Note that this implementation table is _not_ wait-free;
 //! a thread can race resizing and never reach a cannonical table,
 //! and may not linearizable.
+//!
+//!
+//!# Example #
+//!
+//!```rust
+//!use click_map::HashMap;
+//!
+//!use std::sync::Arc;
+//!use std::thread;
+//!
+//!let map = Arc::new(HashMap::new());
+//!
+//!
+//!let threads_map = map.clone();
+//!thread::spawn(move || for i in 0..50 {
+//!    threads_map.insert(i*2, i*2);
+//!});
+//!
+//!let threads_map = map.clone();
+//!thread::spawn(move || for i in 0..50 {
+//!    threads_map.insert(i*2 + 1, i*2 + 101);
+//!});
+//!
+//!for i in 0..100 {
+//!    'wait_for_insert: loop {
+//!        match map.get_then(&i, |&v| v) {
+//!            None => continue 'wait_for_insert,
+//!            Some(val) if i % 2 == 0 => {
+//!                assert_eq!(val, i);
+//!                break 'wait_for_insert
+//!            },
+//!            Some(val) => {
+//!                assert_eq!(val, i + 100);
+//!                break 'wait_for_insert
+//!            }
+//!        }
+//!    }
+//!}
+//!```
 //!
 
 // FIXME ensure that boxes have no pointees before they're freed
@@ -50,11 +89,39 @@ impl<K, V> HashMap<K, V, RandomState> {
 impl<K, V, H> HashMap<K, V, H>
 where H: BuildHasher + Clone, {
 
+    /// Insert a key-value pair into the map.
+    /// Return true if the key was not already in the map.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use click_map::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// assert_eq!(map.insert(1, "haha".to_string()), true);
+    /// assert_eq!(map.insert(1, "hoho".to_string()), false);
+    /// map.remove(&1);
+    /// assert_eq!(map.insert(1, "hehe".to_string()), true);
+    /// ```
     pub fn insert(&self, key: K, val: V) -> bool
     where K: Clone + PartialEq + Hash {
-        self.insert_and(key, val, |_| ()).is_some()
+        self.insert_and(key, val, |_| ()).is_none()
     }
 
+    /// Insert a key-value pair into the map
+    /// and call a function f on the previous value, if one existed
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use click_map::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// assert_eq!(map.insert_and(1, "haha".to_string(), |old| old.clone()), None);
+    /// assert_eq!(map.insert_and(1, "hoho".to_string(), |old| old.clone()), Some("haha".to_string()));
+    /// map.remove(&1);
+    /// assert_eq!(map.insert_and(1, "hehe".to_string(), |old| old.clone()), None);
+    /// ```
     pub fn insert_and<F, T>(&self, key: K, val: V, f: F) -> Option<T>
     where
         K: Clone + PartialEq + Hash,
@@ -74,20 +141,41 @@ where H: BuildHasher + Clone, {
         })
     }
 
-    pub fn insert_if_new(&self, key: K, val: V)
+    /// Insert a key-value pair into the map
+    /// iff the key is not alredy in the map.
+    /// Returns true if a new value is insterted
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use click_map::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// assert_eq!(map.insert_if_new(0x31, "haha".to_string()), true);
+    /// assert_eq!(map.insert_if_new(0x31, "hoho".to_string()), false);
+    /// map.remove(&0x31);
+    /// assert_eq!(map.insert_if_new(0x31, "hehe".to_string()), true);
+    /// ```
+    pub fn insert_if_new(&self, key: K, val: V) -> bool
     where
         K: Clone + PartialEq + Hash, {
-        self.insert_if_new_then(key, val, |_| ())
+        self.insert_if_new_then(key, val, |_| ()).is_ok()
     }
 
-    pub fn insert_if_new_then<F, T>(&self, key: K, val: V, f: F) -> T
+    /// Insert a key-value pair into the map
+    /// iff the key is not alredy in the map
+    /// then call a function on the value in the map.
+    pub fn insert_if_new_then<F, T>(&self, key: K, val: V, f: F) -> Result<T, T>
     where
         K: Clone + PartialEq + Hash,
         F: for<'v > FnOnce(&'v V) -> T, {
         epoch::pin(|pin| {
             let (need_flush, t) = self.insert_key_then(key, val, pin, move |cell, val, pin| unsafe {
-                let val = &cell.val.insert_if_empty(val, pin).deref().val;
-                f(val)
+                let val = cell.val.insert_if_empty(val, pin);
+                match val {
+                    Ok(v) => Ok(f(&v.deref().val)),
+                    Err(v) => Err(f(&v.deref().val)),
+                }
             });
             if need_flush { pin.flush() }
             t
@@ -122,6 +210,8 @@ where H: BuildHasher + Clone, {
         (need_flush, old_val)
     }
 
+    /// Garbage collect the tombstones in the map
+    /// by moving all live values to a fresh allocation.
     pub fn gc_tombstones(&self)
     where K: Clone + PartialEq{
         let pre = &self.ptr;
@@ -141,7 +231,20 @@ where H: BuildHasher + Clone, {
 }
 
 impl<K, V, H> HashMap<K, V, H> {
-    pub fn get_and<Q, F, T>(&self, key: &Q, and: F) -> Option<T>
+
+    /// Call a closure on the value associated with a key, if one exists.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use click_map::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// map.insert(1, "haha".to_string());
+    /// assert_eq!(map.get_then(&1, |s| s.len()), Some(4));
+    /// assert_eq!(map.get_then(&0, |s| s.len()), None);
+    /// ```
+    pub fn get_then<Q, F, T>(&self, key: &Q, and: F) -> Option<T>
     where
         H: BuildHasher,
         K: Borrow<Q>,
@@ -157,6 +260,7 @@ impl<K, V, H> HashMap<K, V, H> {
         })
     }
 
+    /// remove a key-value pair from the map.
     pub fn remove<Q>(&self, key: &Q)
     where
         H: BuildHasher,
@@ -165,6 +269,8 @@ impl<K, V, H> HashMap<K, V, H> {
         self.remove_and(key, |_| ());
     }
 
+    /// remove a key-value pair from the map, and if one was removed
+    /// call a function on the removed value.
     pub fn remove_and<Q, F, T>(&self, key: &Q, f: F) -> Option<T>
     where
         H: BuildHasher,
@@ -369,12 +475,12 @@ impl<V> ValPtr<V> {
         }
     }
 
-    fn insert_if_empty<'p>(&self, mut val: Box<ValBox<V>>, pin: &'p Scope) -> Ptr<'p, ValBox<V>> {
+    fn insert_if_empty<'p>(&self, mut val: Box<ValBox<V>>, pin: &'p Scope) -> Result<Ptr<'p, ValBox<V>>, Ptr<'p, ValBox<V>>> {
         let mut old = Ptr::null();
         loop {
             let res = self.ptr.compare_and_swap_owned(old, val, AcqRel, pin);
             match res {
-                Ok(p) => return p,
+                Ok(p) => return Ok(p),
                 Err((current, new)) => {
                     let current_tag = current.tag();
                     if current_tag == TOMBSTONE || current_tag == MOVED {
@@ -382,7 +488,7 @@ impl<V> ValPtr<V> {
                         val = new;
                         continue
                     }
-                    return current
+                    return Err(current)
                 },
             }
         }
