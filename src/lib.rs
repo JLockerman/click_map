@@ -860,7 +860,7 @@ impl<K, V, H> Table<K, V, H> {
     fn max_probe_len(&self) -> usize {
         //TODO benchmark
         // (1 << self.shift) / 8
-        8
+        4
     }
 
     #[inline(always)]
