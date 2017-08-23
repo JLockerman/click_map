@@ -1001,12 +1001,14 @@ impl<K, V, H> Drop for Table<K, V, H> {
 }
 
 fn search_path(hash: usize, shift: u8) -> SearchPath {
-    SearchPath{hash, mask: (1 << shift) - 1}
+    SearchPath{hash, mask: (1 << shift) - 1, div: (1<<shift) - 1, offset: 0, }
 }
 
 struct SearchPath {
     hash: usize,
     mask: usize,
+    div: usize,
+    offset: usize,
 }
 
 impl Iterator for SearchPath {
@@ -1014,8 +1016,10 @@ impl Iterator for SearchPath {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        let pos = self.hash & self.mask;
-        self.hash += 1;
+        let h1 = self.hash & self.mask;
+        let h2 = 1 + (self.hash % self.div);
+        let pos = (h1 + self.offset * h2) & self.mask;
+        self.offset +=1;
         Some(pos as isize)
     }
 }
