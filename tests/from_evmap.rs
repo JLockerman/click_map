@@ -14,6 +14,7 @@ fn busybusybusy_slow() {
 }
 
 fn busybusybusy_inner(slow: bool) {
+    use std::sync::Arc;
     use std::time;
     use std::thread;
 
@@ -22,7 +23,7 @@ fn busybusybusy_inner(slow: bool) {
     if !slow {
         n *= 100;
     }
-    let map = HashMap::new();
+    let map = Arc::new(HashMap::new());
 
     let rs: Vec<_> = (0..threads)
         .map(|_| {

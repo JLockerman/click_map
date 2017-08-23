@@ -16,7 +16,6 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{drop, forget};
-use std::sync::Arc;
 use std::sync::atomic::{self, Ordering};
 use Ordering::*;
 
@@ -24,11 +23,16 @@ use coco::epoch::{self, Atomic, Scope, Owned as Box, Ptr};
 
 mod fmt;
 
-#[derive(Clone)]
 pub struct HashMap<K, V, H = RandomState> {
     //TODO we should probably have the Arc be a user responsibility
-    ptr: Arc<Atomic<Table<K, V, H>>>,
+    ptr: Atomic<Table<K, V, H>>,
 }
+
+unsafe impl<K, V, H> Send for HashMap<K, V, H>
+where K: Send + Sync, V: Send + Sync, H: Send + Sync {}
+
+unsafe impl<K, V, H> Sync for HashMap<K, V, H>
+where K: Send + Sync + , V: Send + Sync + , H: Send + Sync {}
 
 impl<K, V> HashMap<K, V, RandomState> {
     pub fn new() -> Self {
@@ -39,15 +43,13 @@ impl<K, V> HashMap<K, V, RandomState> {
         let cap = if cap < 32 { 32 } else { cap };
         let shift = cap.checked_next_power_of_two().unwrap().trailing_zeros();
         let table = alloc_table(shift as u8, Default::default());
-        let atom = Atomic::from_owned(table);
-        HashMap {
-            ptr: Arc::new(atom),
-        }
+        let ptr = Atomic::from_owned(table);
+        HashMap { ptr }
     }
 }
 
 impl<K, V, H> HashMap<K, V, H>
-where H: BuildHasher + Clone {
+where H: BuildHasher + Clone, {
     pub fn insert(&self, key: K, val: V) -> bool
     where K: Clone + PartialEq + Hash {
         self.insert_and(key, val, |_| ()).is_some()
@@ -57,7 +59,7 @@ where H: BuildHasher + Clone {
     where
         K: Clone + PartialEq + Hash,
         F: for<'v >FnOnce(&'v V) -> T, {
-        let pre = &*self.ptr;
+        let pre = &self.ptr;
         epoch::pin(|pin| {
             let table_ptr = pre.load(Acquire, pin);
             let table = unsafe { table_ptr.deref() };
@@ -69,7 +71,12 @@ where H: BuildHasher + Clone {
             let (new_table, old_val) = table.insert(key, val, pin);
             let mut need_flush = false;
             if let Some(new_table) = new_table {
-                let _ = pre.compare_and_swap(table_ptr, new_table, AcqRel, pin);
+                if let Ok(..) = pre.compare_and_swap(table_ptr, new_table, AcqRel, pin) {
+                    unsafe {
+                        pin.defer_free_array(table.table.load(Acquire, pin), table.capacity());
+                        pin.defer_free(Ptr::from_raw(table));
+                    }
+                }
                 need_flush = true;
             }
             let t = match old_val {
@@ -87,12 +94,17 @@ where H: BuildHasher + Clone {
 
     pub fn gc_tombstones(&self)
     where K: Clone + PartialEq{
-        let pre = &*self.ptr;
+        let pre = &self.ptr;
         epoch::pin(|pin| {
             let table_ptr = pre.load(Acquire, pin);
             let table = unsafe { table_ptr.deref() };
             let new_table = table.gc_tombstones(pin);
-            let _ = pre.compare_and_swap(table_ptr, new_table, AcqRel, pin);
+            if let Ok(..) = pre.compare_and_swap(table_ptr, new_table, AcqRel, pin) {
+                unsafe {
+                    pin.defer_free_array(table.table.load(Acquire, pin), table.capacity());
+                    pin.defer_free(Ptr::from_raw(table));
+                }
+            }
             pin.flush();
         });
     }
@@ -137,6 +149,25 @@ impl<K, V, H> HashMap<K, V, H> {
             let t = table.remove_and(hash, key, pin, f);
             t
         })
+    }
+}
+
+impl<K, V, H> Drop for HashMap<K, V, H> {
+    fn drop(&mut self) {
+        use ::std::slice;
+        println!("mpa drop");
+        epoch::pin(|pin| unsafe {
+            let table = self.ptr.load(Acquire, pin).deref();
+            let cells = table.table.load(Acquire, pin).deref();
+            let cells = slice::from_raw_parts(cells, table.capacity());
+            for cell in cells {
+                let _ = cell.val.remove_and(pin, |v| ());//println!("dropping {:?}", v)
+                cell.key.try_free(pin);
+            }
+            pin.defer_free_array(table.table.load(Acquire, pin), table.capacity());
+            pin.defer_free(Ptr::from_raw(table));
+            pin.flush()
+        });
     }
 }
 
@@ -234,16 +265,16 @@ impl<K> KeyPtr<K> {
         }
     }
 
-    fn try_free<'p>(&self, pin: &'p Scope) {
+    fn try_free<'p>(&self, pin: &'p Scope) -> bool {
         let original = self.load(pin);
-        if original.is_null() { return }
+        if original.is_null() { return false }
         match original.tag() {
-            TOMBSTONE | MOVED => return,
+            TOMBSTONE | MOVED => return false,
             _ => (),
         }
         match self.ptr.compare_and_swap(original, original.with_tag(TOMBSTONE), AcqRel, pin) {
-            Err(..) => return,
-            Ok(()) => unsafe{ pin.defer_drop(original) },
+            Err(..) => return false,
+            Ok(()) => unsafe{ pin.defer_drop(original); true },
         }
     }
 }
@@ -425,7 +456,7 @@ impl<'p, V:'p> OldVal<'p, V> {
 }
 
 impl<K, V, H> Table<K, V, H>
-where H: Clone {
+where H: Clone, {
 
     fn insert<'p>(&self, key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Scope)
     -> (Option<Ptr<'p, Self>>, OwnedVal<'p, V>)
@@ -454,11 +485,6 @@ where H: Clone {
                 let table = match next { Ok(p) | Err((p, _)) => p, };
                 let t = unsafe { table.deref() };
                 self.move_contents_to(t, last, pin);
-                //FIXME do this in caller after CAS
-                unsafe {
-                    pin.defer_free_array(self.table.load(Acquire, pin), self.capacity());
-                    pin.defer_free(Ptr::from_raw(self));
-                }
                 let (new_table, old_val) = t.insert(key, val, pin);
                 (new_table.or(Some(table)), old_val)
             },
@@ -499,11 +525,6 @@ where H: Clone {
         let table = match next { Ok(p) | Err((p, _)) => p, };
         let t = unsafe { table.deref() };
         self.move_contents_to(t, 0, pin);
-        //FIXME do this in caller after CAS
-        unsafe {
-            pin.defer_free_array(self.table.load(Acquire, pin), self.capacity());
-            pin.defer_free(Ptr::from_raw(self));
-        }
         table
     }
 
@@ -621,7 +642,6 @@ impl<K, V, H> Table<K, V, H> {
                     None => continue,
                     Some(key) => key,
                 };
-                //FIXME handle running out of space (concurrent writes)
                 let moved = move_cell(old_cell, new_table, new_shift, key, pin);
                 if !moved { unimplemented!() }
             }
