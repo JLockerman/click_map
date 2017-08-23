@@ -24,7 +24,6 @@ use coco::epoch::{self, Atomic, Scope, Owned as Box, Ptr};
 mod fmt;
 
 pub struct HashMap<K, V, H = RandomState> {
-    //TODO we should probably have the Arc be a user responsibility
     ptr: Atomic<Table<K, V, H>>,
 }
 
@@ -50,6 +49,7 @@ impl<K, V> HashMap<K, V, RandomState> {
 
 impl<K, V, H> HashMap<K, V, H>
 where H: BuildHasher + Clone, {
+
     pub fn insert(&self, key: K, val: V) -> bool
     where K: Clone + PartialEq + Hash {
         self.insert_and(key, val, |_| ()).is_some()
@@ -59,26 +59,8 @@ where H: BuildHasher + Clone, {
     where
         K: Clone + PartialEq + Hash,
         F: for<'v >FnOnce(&'v V) -> T, {
-        let pre = &self.ptr;
         epoch::pin(|pin| {
-            let table_ptr = pre.load(Acquire, pin);
-            let table = unsafe { table_ptr.deref() };
-            let mut hasher = table.hasher.build_hasher();
-            key.hash(&mut hasher);
-            let hash = hasher.finish();
-            let key = Box::new((hash, key));
-            let val = Box::new(ValBox{ val, _align: [] });
-            let (new_table, old_val) = table.insert(key, val, pin);
-            let mut need_flush = false;
-            if let Some(new_table) = new_table {
-                if let Ok(..) = pre.compare_and_swap(table_ptr, new_table, AcqRel, pin) {
-                    unsafe {
-                        pin.defer_free_array(table.table.load(Acquire, pin), table.capacity());
-                        pin.defer_free(Ptr::from_raw(table));
-                    }
-                }
-                need_flush = true;
-            }
+            let (need_flush, old_val) = self.insert_key_then(key, val, pin, |cell, val, pin| cell.val.swap(val, pin));
             let t = match old_val {
                 OwnedVal::Owned(v) => unsafe {
                     let t = v.0.as_ref().map(|v| f(&v.val));
@@ -90,6 +72,54 @@ where H: BuildHasher + Clone, {
             if need_flush { pin.flush() }
             t
         })
+    }
+
+    pub fn insert_if_new(&self, key: K, val: V)
+    where
+        K: Clone + PartialEq + Hash, {
+        self.insert_if_new_then(key, val, |_| ())
+    }
+
+    pub fn insert_if_new_then<F, T>(&self, key: K, val: V, f: F) -> T
+    where
+        K: Clone + PartialEq + Hash,
+        F: for<'v > FnOnce(&'v V) -> T, {
+        epoch::pin(|pin| {
+            let (need_flush, t) = self.insert_key_then(key, val, pin, move |cell, val, pin| unsafe {
+                let val = &cell.val.insert_if_empty(val, pin).deref().val;
+                f(val)
+            });
+            if need_flush { pin.flush() }
+            t
+        })
+    }
+
+    fn insert_key_then<'p, Then, Out>(&self, key: K, val: V, pin: &'p Scope, then: Then) -> (bool, Out)
+    where
+        K: 'p + Clone + PartialEq + Hash,
+        V: 'p,
+        H: 'p,
+        Then: for<'a> FnOnce(&'a Cell<K, V>, Box<ValBox<V>>, &'p Scope) -> Out, {
+        let pre = &self.ptr;
+        let table_ptr = pre.load(Acquire, pin);
+        let table = unsafe { table_ptr.deref() };
+        let mut hasher = table.hasher.build_hasher();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        let key = Box::new((hash, key));
+        let val = Box::new(ValBox{ val, _align: [] });
+        let (new_table, old_val) = table.insert(key, val, pin, then);
+        let mut need_flush = false;
+        if let Some(new_table) = new_table {
+            if let Ok(..) = pre.compare_and_swap(table_ptr, new_table, AcqRel, pin) {
+                unsafe {
+                    pin.defer_free_array(table.table.load(Acquire, pin), table.capacity());
+                    pin.defer_free(Ptr::from_raw(table));
+                }
+            }
+            need_flush = true;
+        }
+        (need_flush, old_val)
     }
 
     pub fn gc_tombstones(&self)
@@ -212,7 +242,13 @@ impl<K> KeyPtr<K> {
 
     fn try_fill<'p>(&self, key: Box<(u64, K)>, pin: &'p Scope)
     -> Result<Ptr<'p, (u64, K)>, (Ptr<'p, (u64, K)>, Box<(u64, K)>)> {
-        self.ptr.compare_and_swap_owned(KeyPtr::empty(), key, AcqRel, pin)
+        let original = self.ptr.load(Acquire, pin);
+        if original.is_null() {
+            self.ptr.compare_and_swap_owned(KeyPtr::empty(), key, AcqRel, pin)
+        } else {
+            Err((original, key))
+        }
+
     }
 
     fn try_fill_owned<'p>(&self, key: OwnedKey<'p, K>, pin: &'p Scope)
@@ -322,6 +358,25 @@ impl<V> ValPtr<V> {
             MOVED => OwnedVal::Moved,
             _ if old.is_null() => OwnedVal::Empty,
             _ => OwnedVal::Owned(Owned(old)),
+        }
+    }
+
+    fn insert_if_empty<'p>(&self, mut val: Box<ValBox<V>>, pin: &'p Scope) -> Ptr<'p, ValBox<V>> {
+        let mut old = Ptr::null();
+        loop {
+            let res = self.ptr.compare_and_swap_owned(old, val, AcqRel, pin);
+            match res {
+                Ok(p) => return p,
+                Err((current, new)) => {
+                    let current_tag = current.tag();
+                    if current_tag == TOMBSTONE || current_tag == MOVED {
+                        old = current;
+                        val = new;
+                        continue
+                    }
+                    return current
+                },
+            }
         }
     }
 
@@ -457,14 +512,16 @@ impl<'p, V:'p> OldVal<'p, V> {
 impl<K, V, H> Table<K, V, H>
 where H: Clone, {
 
-    fn insert<'p>(&self, key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Scope)
-    -> (Option<Ptr<'p, Self>>, OwnedVal<'p, V>)
-    where K: Clone + PartialEq {
+    fn insert<'p, F, T>(&self, key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Scope, on_find: F)
+    -> (Option<Ptr<'p, Self>>, T)
+    where
+        K: Clone + PartialEq,
+        F: for<'a> FnOnce(&'a Cell<K, V>, Box<ValBox<V>>, &'p Scope) -> T {
         //TODO I think pre-checking breaks linearizability
         //if let Some(table) = self.next.load(pin).as_ref() {
         //    return table.insert(key, val, pin)
         //}
-        match self.try_emplace(key, val, pin) {
+        match self.try_emplace(key, val, pin, on_find) {
             // If a table started resizing after we started inserting we may not have seen it
             // and other threads may not move our entry if we replaced an empty which they
             // have already bypassed.
@@ -478,21 +535,23 @@ where H: Clone, {
                 }
                 return (None, old)
             },
-            Err((last, key, val)) => {
+            Err((last, key, val, on_find)) => {
                 let new_table = self.alloc_next_table();
                 let next = self.next.compare_and_swap_owned(Ptr::null(), new_table, AcqRel, pin);
                 let table = match next { Ok(p) | Err((p, _)) => p, };
                 let t = unsafe { table.deref() };
                 self.move_contents_to(t, last, pin);
-                let (new_table, old_val) = t.insert(key, val, pin);
+                let (new_table, old_val) = t.insert(key, val, pin, on_find);
                 (new_table.or(Some(table)), old_val)
             },
         }
     }
 
-    fn try_emplace<'p>(&self, mut key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Scope)
-    -> Result<(isize, OwnedVal<'p, V>), (isize, Box<(u64, K)>, Box<ValBox<V>>)>
-    where K: PartialEq {
+    fn try_emplace<'p, F, T>(&self, mut key: Box<(u64, K)>, val: Box<ValBox<V>>, pin: &'p Scope, on_find: F)
+    -> Result<(isize, T), (isize, Box<(u64, K)>, Box<ValBox<V>>, F)>
+    where
+        K: PartialEq,
+        F: for<'a> FnOnce(&'a Cell<K, V>, Box<ValBox<V>>, &'p Scope) -> T {
         unsafe {
             let table = self.table.load(Acquire, pin).as_raw();
             let mut last = key.0 as isize;
@@ -501,19 +560,21 @@ where H: Clone, {
                 let cell = table.offset(i);
                 match (*cell).key.try_fill(key, pin) {
                     Ok(..) => {
-                        let old = (*cell).val.swap(val, pin);
+                        // let old = (*cell).val.swap(val, pin);
+                        let old = on_find(&*cell, val, pin);
                         return Ok((i, old))
                     }
                     Err((found, k)) => {
                         key = k;
                         if found.as_ref().map(|f| f == &*key).unwrap_or_else(|| false) {
-                            let old = (*cell).val.swap(val, pin);
+                            // let old = (*cell).val.swap(val, pin);
+                            let old = on_find(&*cell, val, pin);
                             return Ok((i, old))
                         }
                     },
                 }
             }
-            Err((last, key, val))
+            Err((last, key, val, on_find))
         }
     }
 
@@ -653,7 +714,9 @@ impl<K, V, H> Table<K, V, H> {
 
     #[inline(always)]
     fn max_probe_len(&self) -> usize {
-        (1 << self.shift) / 8
+        //TODO benchmark
+        // (1 << self.shift) / 8
+        8
     }
 
     #[inline(always)]
@@ -794,51 +857,3 @@ impl Iterator for SearchPath {
 //         Some(pos)
 //     }
 // }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn insert() {
-        let map = HashMap::with_capacity(32);
-        assert_eq!(map.get_and(&1, |&i| i), None);
-        assert_eq!(map.get_and(&32, |&i| i), None);
-        assert_eq!(map.get_and(&3, |&i| i), None);
-        assert_eq!(map.get_and(&2, |&i| i), None);
-        map.insert(1, 1);
-        assert_eq!(map.get_and(&1, |&i| i), Some(1));
-        assert_eq!(map.get_and(&32, |&i| i), None);
-        assert_eq!(map.get_and(&3, |&i| i), None);
-        assert_eq!(map.get_and(&2, |&i| i), None);
-        map.insert(32, 100);
-        assert_eq!(map.get_and(&1, |&i| i), Some(1));
-        assert_eq!(map.get_and(&32, |&i| i), Some(100));;
-        assert_eq!(map.get_and(&3, |&i| i), None);
-        assert_eq!(map.get_and(&2, |&i| i), None);
-        map.insert(3, 8);
-        assert_eq!(map.get_and(&1, |&i| i), Some(1));
-        assert_eq!(map.get_and(&32, |&i| i), Some(100));
-        assert_eq!(map.get_and(&3, |&i| i), Some(8));
-        assert_eq!(map.get_and(&2, |&i| i), None);
-        map.insert(1, 20);
-        assert_eq!(map.get_and(&1, |&i| i), Some(20));
-        assert_eq!(map.get_and(&32, |&i| i), Some(100));
-        assert_eq!(map.get_and(&3, |&i| i), Some(8));
-        assert_eq!(map.get_and(&2, |&i| i), None);
-    }
-
-    #[test]
-    fn resize() {
-        let map = HashMap::with_capacity(32);
-        for i in 0..100 {
-            map.insert(i, i);
-        }
-        for i in 0..100 {
-            assert_eq!(map.get_and(&i, |&i| i), Some(i));
-        }
-        for i in 100..200 {
-            assert_eq!(map.get_and(&i, |&i| i), None);
-        }
-    }
-}
