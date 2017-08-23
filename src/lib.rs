@@ -242,17 +242,25 @@ impl<K> KeyPtr<K> {
 
     fn try_fill<'p>(&self, key: Box<(u64, K)>, pin: &'p Scope)
     -> Result<Ptr<'p, (u64, K)>, (Ptr<'p, (u64, K)>, Box<(u64, K)>)> {
+        // regular loads can be much faster than cas (on recent intel ~10x)
+        // and don't invalidate other core's cache lines like cas might (again on recent intel)
+        // so we check if the slot is empty before trying to insert
         let original = self.ptr.load(Acquire, pin);
-        if original.is_null() {
-            self.ptr.compare_and_swap_owned(KeyPtr::empty(), key, AcqRel, pin)
-        } else {
-            Err((original, key))
+        if !original.is_null() {
+            return Err((original, key))
         }
-
+        self.ptr.compare_and_swap_owned(KeyPtr::empty(), key, AcqRel, pin)
     }
 
     fn try_fill_owned<'p>(&self, key: OwnedKey<'p, K>, pin: &'p Scope)
     -> Result<(), (Ptr<'p, (u64, K)>, OwnedKey<'p, K>)> {
+        // regular loads can be much faster than cas (on recent intel ~10x)
+        // and don't invalidate other core's cache lines like cas might (again on recent intel)
+        // so we check if the slot is empty before trying to insert
+        let original = self.ptr.load(Acquire, pin);
+        if !original.is_null() {
+            return Err((original, key))
+        }
         match key {
             OwnedKey::Boxed(key) => self.ptr
                 .compare_and_swap_owned(KeyPtr::empty(), key, AcqRel, pin)
